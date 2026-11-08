@@ -1,0 +1,16 @@
+# docker-compose.yml
+services:
+  wallet-backend:
+    build: .
+    container_name: faucetdrops-wallet
+    restart: unless-stopped
+    ports:
+      - "10000:10000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10000/docs')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
