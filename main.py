@@ -11,7 +11,7 @@ import nacl.signing
 import nacl.exceptions
 from stellar_sdk import Keypair as StellarKeypair
 from mnemonic import Mnemonic as BIP39
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -44,6 +44,9 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SUPABASE_ANON_KEY    = os.getenv("SUPABASE_ANON_KEY", "")
 
 SUPABASE_AUTH_URL = SUPABASE_URL
+
+# Admin key for one-off maintenance endpoints (e.g. profile email backfill)
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 # ── Multi-project Supabase auth ─────────────────────────────────────────────
 # Tokens are verified by the Supabase project that issued them. Add other
@@ -521,8 +524,6 @@ def db_link_social(address: str, provider: str, uid: str, handle: str | None = N
 # DB helpers — cross-provider wallet lookup
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Add this to db_get_wallet_by_any_supabase_identity, before the per-identity loop:
-
 def db_get_wallet_by_any_supabase_identity(
     identities: list[dict],
 ) -> tuple[dict | None, str | None, str | None]:
@@ -714,6 +715,53 @@ def db_mark_legacy_claimed(legacy_id: str, wallet_address: str):
 # Supabase token resolver — shared by all SUPABASE_OAUTH_PROVIDERS + passkey
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _profile_meta_from_user(provider: str, user_data: dict) -> tuple[str | None, dict]:
+    """
+    Builds (handle, profile_meta) from a Supabase user object.
+    Uses the identity that matches `provider` — NOT identities[0], which is
+    whichever provider the user linked first (e.g. Twitter when linking Google).
+    """
+    identities = user_data.get("identities") or []
+    wanted = {"twitter", "x"} if provider == "twitter" else {provider}
+    match  = next((i for i in identities if i.get("provider") in wanted), None)
+    if match is None and identities:
+        # Fallback: the most recently linked identity
+        match = max(identities, key=lambda i: i.get("created_at") or "")
+    id_data = (match or {}).get("identity_data", {}) or {}
+
+    handle = (
+        id_data.get("email")
+        or id_data.get("preferred_username")
+        or id_data.get("user_name")
+        or id_data.get("login")
+        or id_data.get("name")
+        or id_data.get("username")
+        or user_data.get("email")
+    )
+
+    profile_meta = {
+        "email":        id_data.get("email") or user_data.get("email"),
+        "avatar_url": (
+            id_data.get("avatar_url")
+            or id_data.get("picture")
+            or id_data.get("profile_image_url")
+        ),
+        "display_name": (
+            id_data.get("full_name")
+            or id_data.get("name")
+            or id_data.get("login")
+            or id_data.get("username")
+            or id_data.get("preferred_username")
+        ),
+        "twitter_handle":  (id_data.get("preferred_username") or id_data.get("user_name")) if provider == "twitter" else None,
+        "discord_handle":  id_data.get("username")                                         if provider == "discord" else None,
+        "github_handle":   (id_data.get("login") or id_data.get("user_name"))              if provider == "github" else None,
+        "linkedin_handle": id_data.get("preferred_username")                               if provider == "linkedin" else None,
+        "notion_handle":   id_data.get("name")                                             if provider == "notion" else None,
+    }
+    return handle, profile_meta
+
+
 async def resolve_supabase_provider_uid(
     provider: str, supabase_access_token: str
 ) -> tuple[str, str | None, dict, list[dict]]:
@@ -745,57 +793,20 @@ async def resolve_supabase_provider_uid(
     if not uid:
         raise HTTPException(500, "Supabase returned no user ID")
 
-    identities = user_data.get("identities") or []
-    id_data    = identities[0].get("identity_data", {}) if identities else {}
-
-    handle = (
-        id_data.get("email")
-        or id_data.get("preferred_username")
-        or id_data.get("user_name")
-        or id_data.get("login")
-        or id_data.get("name")
-        or id_data.get("username")
-        or user_data.get("email")
-    )
-
-    profile_meta = {
-        "email":        id_data.get("email") or user_data.get("email"),
-        "avatar_url": (
-            id_data.get("avatar_url")
-            or id_data.get("picture")
-            or id_data.get("profile_image_url")
-        ),
-        "display_name": (
-            id_data.get("full_name")
-            or id_data.get("name")
-            or id_data.get("login")
-            or id_data.get("username")
-            or id_data.get("preferred_username")
-        ),
-        "twitter_handle":  id_data.get("preferred_username") if provider == "twitter"  else None,
-        "discord_handle":  id_data.get("username")           if provider == "discord"  else None,
-        "github_handle":   id_data.get("login")              if provider == "github"   else None,
-        "linkedin_handle": id_data.get("preferred_username") if provider == "linkedin" else None,
-        "notion_handle":   id_data.get("name")               if provider == "notion"   else None,
-    }
+    handle, profile_meta = _profile_meta_from_user(provider, user_data)
 
     # Normalized identity list for cross-provider lookup.
     # Supabase uses "x" for Twitter internally; we store "twitter".
     # "email" provider entries (email/password) are not wallet login methods — skip.
-    # Passkey identities come through with provider == "passkey" and id == credential_id.
-    normalized_identities: list[dict] = []
-    normalized_identities.append({
-    "provider": "__supabase_uid__",   # sentinel — only used for cross-lookup
-    "id": uid,
-    })
+    normalized_identities: list[dict] = [{
+        "provider": "__supabase_uid__",   # sentinel — only used for cross-lookup
+        "id": uid,
+    }]
 
-    for ident in identities:
+    for ident in user_data.get("identities") or []:
         raw_p = ident.get("provider", "")
         if raw_p == "email":
             continue
-        # For passkey, the identity id is the credential ID, not the user UUID.
-        # We still add it so future credential-based lookups work, but the
-        # primary match key for passkey is the Supabase user UUID above.
         normalized_identities.append({
             "provider": "twitter" if raw_p == "x" else raw_p,
             "id":       ident.get("id", ""),
@@ -856,10 +867,6 @@ def get_or_create_wallet(
         return existing, legacy
 
     # ── 2. Cross-provider lookup ──────────────────────────────────────────────
-    # A user who registered with Google and now logs in with Twitter (or any
-    # other linked provider) must land on the same wallet.  We check every
-    # identity on their Supabase account against linked_socials and re-register
-    # the new (provider, uid) pair so future logins hit the fast path.
     if supabase_identities:
         cross_wallet, matched_provider, matched_uid = db_get_wallet_by_any_supabase_identity(
             supabase_identities
@@ -925,12 +932,25 @@ def get_or_create_wallet(
 # Profile upsert
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _email_taken_by_other(email: str, wallet: str) -> bool:
+    res = (
+        supabase.table("user_profiles")
+        .select("wallet_address")
+        .eq("email", email)
+        .execute()
+    )
+    return any((r.get("wallet_address") or "").lower() != wallet for r in (res.data or []))
+
+
 def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: dict):
     """
     Called after every social login / link.
-    Only fills in fields that are MISSING — never overwrites user manual edits.
+    Fills missing fields only — never overwrites a user's manual edits.
+    Linking Google (or any provider with an email) sets the profile email
+    when the profile has none, unless another profile already uses it.
     """
     wallet = evm_address.lower()
+    email  = (profile_meta.get("email") or "").strip().lower()
 
     existing = (
         supabase.table("user_profiles")
@@ -943,8 +963,12 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
         row   = existing.data[0]
         patch = {}
 
-        if not row.get("email") and profile_meta.get("email"):
-            patch["email"] = profile_meta["email"]
+        if email and not row.get("email"):
+            if _email_taken_by_other(email, wallet):
+                print(f"[profile-upsert] {email} already used by another profile — not linking to {wallet}")
+            else:
+                patch["email"] = email
+
         if not row.get("avatar_url") and profile_meta.get("avatar_url"):
             patch["avatar_url"] = profile_meta["avatar_url"]
 
@@ -956,6 +980,7 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
         if patch:
             patch["updated_at"] = datetime.now(timezone.utc).isoformat()
             supabase.table("user_profiles").update(patch).eq("wallet_address", wallet).execute()
+            print(f"[profile-upsert] {wallet} via {provider}: updated {list(patch)}")
 
     else:
         base_name = (
@@ -971,10 +996,12 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
         if supabase.table("user_profiles").select("username").eq("username", username).execute().data:
             username = f"{base_name}_{wallet[-4:]}"
 
+        safe_email = email if email and not _email_taken_by_other(email, wallet) else None
+
         supabase.table("user_profiles").insert({
             "wallet_address":   wallet,
             "username":         username,
-            "email":            profile_meta.get("email") or "",
+            "email":            safe_email,   # None, never "" — avoids unique-constraint clashes
             "avatar_url":       profile_meta.get("avatar_url") or "",
             "twitter_handle":   profile_meta.get("twitter_handle"),
             "discord_handle":   profile_meta.get("discord_handle"),
@@ -983,6 +1010,61 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
             "notion_handle":    profile_meta.get("notion_handle"),
             "updated_at":       datetime.now(timezone.utc).isoformat(),
         }).execute()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Profile backfill from already-linked socials
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROFILE_SYNC_ORDER = ["google", "github", "discord", "twitter", "linkedin", "notion"]
+
+async def fetch_supabase_user_admin(uid: str) -> dict | None:
+    """Reads a Supabase user (with identities) from the main project using the service key."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{uid}",
+            headers=_supabase_auth_headers(),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+
+
+async def sync_profile_from_linked_socials(address: str) -> bool:
+    """
+    If the profile has no email, pull it (plus handles/avatar) from the
+    wallet's already-linked Supabase socials — Google first.
+    Returns True if a sync was attempted.
+    """
+    address = address.lower()
+
+    prof = (
+        supabase.table("user_profiles")
+        .select("email")
+        .eq("wallet_address", address)
+        .execute()
+    )
+    if prof.data and prof.data[0].get("email"):
+        return False
+
+    rows = [
+        r for r in db_get_linked_socials_with_handles(address)
+        if r["provider"] in SUPABASE_OAUTH_PROVIDERS and r["provider"] != "passkey"
+    ]
+    rows.sort(key=lambda r: PROFILE_SYNC_ORDER.index(r["provider"])
+              if r["provider"] in PROFILE_SYNC_ORDER else 99)
+
+    user_cache: dict[str, dict | None] = {}
+    for row in rows:
+        uid = row["uid"]
+        if uid not in user_cache:
+            user_cache[uid] = await fetch_supabase_user_admin(uid)
+        user = user_cache[uid]
+        if not user:
+            continue
+        _, meta = _profile_meta_from_user(row["provider"], user)
+        upsert_profile_from_social(address, row["provider"], meta)
+
+    return True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # External wallet registration + social linking helpers
@@ -1103,9 +1185,8 @@ ALLOWED_ORIGINS = [
     "https://www.agentcombat.xyz",
     "https://sigma-protocol.vercel.app",
     "https://www.sigma-protocol.vercel.app",
-    "https://blockchainlautech"
-    "https://onchain.blockchainlautech.club"
-
+    "https://blockchainlautech",
+    "https://onchain.blockchainlautech.club",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -1244,8 +1325,8 @@ async def social_login(body: SocialLoginRequest):
     if provider in SUPABASE_OAUTH_PROVIDERS and profile_meta:
         try:
             upsert_profile_from_social(wallet["address"], provider, profile_meta)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[profile-upsert] login failed for {provider}: {e}")
 
     token  = create_token(wallet["address"])
     linked = db_get_linked_socials(wallet["address"])
@@ -1317,8 +1398,8 @@ async def link_social(
     if provider in SUPABASE_OAUTH_PROVIDERS and profile_meta:
         try:
             upsert_profile_from_social(address, provider, profile_meta)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[profile-upsert] link failed for {provider}: {e}")
 
     linked = db_get_linked_socials(address)
     return {"success": True, "linked_socials": linked}
@@ -1329,6 +1410,13 @@ async def get_wallet_me(address: str = Depends(get_current_address)):
     wallet = db_get_wallet(address)
     if not wallet:
         raise HTTPException(404, "Wallet not found")
+
+    # Self-heal: fill a missing profile email from already-linked Google etc.
+    try:
+        await sync_profile_from_linked_socials(address)
+    except Exception as e:
+        print(f"[profile-sync] /wallet/me failed for {address}: {e}")
+
     linked = db_get_linked_socials(address)
     return {
         "address":                wallet["address"],
@@ -1338,6 +1426,36 @@ async def get_wallet_me(address: str = Depends(get_current_address)):
         "has_pin":                bool(wallet.get("pin_hash")),
         "has_security_questions": bool(wallet.get("security_questions")),
     }
+
+
+@app.post("/admin/backfill-profile-emails")
+async def backfill_profile_emails(x_admin_key: str = Header(...)):
+    """
+    One-off: fill missing profile emails for every wallet that already has
+    Google linked. Run once after deploy:
+      curl -X POST <backend>/admin/backfill-profile-emails -H "x-admin-key: <ADMIN_KEY>"
+    """
+    if not ADMIN_KEY or not hmac.compare_digest(x_admin_key, ADMIN_KEY):
+        raise HTTPException(403, "Forbidden")
+
+    res = (
+        supabase.table("linked_socials")
+        .select("address")
+        .eq("provider", "google")
+        .execute()
+    )
+    addresses = sorted({r["address"] for r in (res.data or [])})
+
+    synced, failed = 0, 0
+    for addr in addresses:
+        try:
+            if await sync_profile_from_linked_socials(addr):
+                synced += 1
+        except Exception as e:
+            failed += 1
+            print(f"[backfill] {addr}: {e}")
+
+    return {"checked": len(addresses), "synced": synced, "failed": failed}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Passkey signing grant
@@ -1356,22 +1474,9 @@ async def passkey_signing_grant(
     immediately before calling this endpoint — re-using the login token is
     intentionally rejected because we need proof of physical presence
     (biometric / device PIN) for every transaction signing operation.
-
-    Flow:
-      1. User initiates tx on frontend
-      2. Frontend calls supabase.auth.signInWithPasskey() → fresh access_token
-      3. Frontend POSTs { supabase_token } here
-      4. Backend verifies the token AND confirms the passkey UID is in linked_socials
-         for this wallet — not just any valid Supabase token
-      5. Backend returns a short-lived signing_grant
-      6. Frontend calls /wallet/export-privatekey with the grant
     """
-    # Verify the fresh Supabase token and extract the passkey UID
     uid, _, _, _ = await resolve_supabase_provider_uid("passkey", body.supabase_token)
 
-    # Confirm this passkey UID is actually linked to the authenticated wallet.
-    # This prevents a user from using someone else's passkey token to get a
-    # signing grant for a wallet they don't control.
     res = (
         supabase.table("linked_socials")
         .select("address")
@@ -1886,6 +1991,9 @@ async def link_phone(
 #     jti         text primary key,
 #     expires_at  bigint not null
 #   );
+#
+# Env:
+#   ADMIN_KEY — required for /admin/backfill-profile-emails
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Run
