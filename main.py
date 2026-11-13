@@ -941,6 +941,54 @@ def _email_taken_by_other(email: str, wallet: str) -> bool:
     )
     return any((r.get("wallet_address") or "").lower() != wallet for r in (res.data or []))
 
+HANDLE_COLUMNS = {
+    "twitter": "twitter_handle", "discord": "discord_handle", "github": "github_handle",
+    "linkedin": "linkedin_handle", "notion": "notion_handle",
+}
+
+async def sync_profile_from_linked_socials(address: str) -> bool:
+    """
+    Fills a missing profile email and missing social handles from the
+    wallet's already-linked Supabase socials. Returns True if a sync ran.
+    """
+    address = address.lower()
+
+    rows = [
+        r for r in db_get_linked_socials_with_handles(address)
+        if r["provider"] in SUPABASE_OAUTH_PROVIDERS and r["provider"] != "passkey"
+    ]
+    if not rows:
+        return False
+
+    prof = (
+        supabase.table("user_profiles")
+        .select("*")
+        .eq("wallet_address", address)
+        .execute()
+    )
+    row = prof.data[0] if prof.data else {}
+    linked = {r["provider"] for r in rows}
+    missing_handle = any(
+        p in linked and not row.get(col) for p, col in HANDLE_COLUMNS.items()
+    )
+    if row.get("email") and not missing_handle:
+        return False
+
+    rows.sort(key=lambda r: PROFILE_SYNC_ORDER.index(r["provider"])
+              if r["provider"] in PROFILE_SYNC_ORDER else 99)
+
+    user_cache: dict[str, dict | None] = {}
+    for r in rows:
+        uid = r["uid"]
+        if uid not in user_cache:
+            user_cache[uid] = await fetch_supabase_user_admin(uid)
+        user = user_cache[uid]
+        if not user:
+            continue
+        _, meta = _profile_meta_from_user(r["provider"], user)
+        upsert_profile_from_social(address, r["provider"], meta)
+
+    return True
 
 def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: dict):
     """
@@ -1028,43 +1076,6 @@ async def fetch_supabase_user_admin(uid: str) -> dict | None:
                 return None
             return await resp.json()
 
-
-async def sync_profile_from_linked_socials(address: str) -> bool:
-    """
-    If the profile has no email, pull it (plus handles/avatar) from the
-    wallet's already-linked Supabase socials — Google first.
-    Returns True if a sync was attempted.
-    """
-    address = address.lower()
-
-    prof = (
-        supabase.table("user_profiles")
-        .select("email")
-        .eq("wallet_address", address)
-        .execute()
-    )
-    if prof.data and prof.data[0].get("email"):
-        return False
-
-    rows = [
-        r for r in db_get_linked_socials_with_handles(address)
-        if r["provider"] in SUPABASE_OAUTH_PROVIDERS and r["provider"] != "passkey"
-    ]
-    rows.sort(key=lambda r: PROFILE_SYNC_ORDER.index(r["provider"])
-              if r["provider"] in PROFILE_SYNC_ORDER else 99)
-
-    user_cache: dict[str, dict | None] = {}
-    for row in rows:
-        uid = row["uid"]
-        if uid not in user_cache:
-            user_cache[uid] = await fetch_supabase_user_admin(uid)
-        user = user_cache[uid]
-        if not user:
-            continue
-        _, meta = _profile_meta_from_user(row["provider"], user)
-        upsert_profile_from_social(address, row["provider"], meta)
-
-    return True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # External wallet registration + social linking helpers
