@@ -753,14 +753,16 @@ def _profile_meta_from_user(provider: str, user_data: dict) -> tuple[str | None,
             or id_data.get("username")
             or id_data.get("preferred_username")
         ),
-        "twitter_handle":  (id_data.get("preferred_username") or id_data.get("user_name")) if provider == "twitter" else None,
-        "discord_handle":  id_data.get("username")                                         if provider == "discord" else None,
-        "github_handle":   (id_data.get("login") or id_data.get("user_name"))              if provider == "github" else None,
-        "linkedin_handle": id_data.get("preferred_username")                               if provider == "linkedin" else None,
-        "notion_handle":   id_data.get("name")                                             if provider == "notion" else None,
     }
-    return handle, profile_meta
 
+    # The provider's handle goes into its own profile column
+    col = HANDLE_COLUMNS.get(provider)
+    if col:
+        value = next((id_data[k] for k in HANDLE_KEYS[provider] if id_data.get(k)), None)
+        if value:
+            profile_meta[col] = str(value).removesuffix("#0")
+
+    return handle, profile_meta
 
 async def resolve_supabase_provider_uid(
     provider: str, supabase_access_token: str
@@ -942,22 +944,41 @@ def _email_taken_by_other(email: str, wallet: str) -> bool:
     return any((r.get("wallet_address") or "").lower() != wallet for r in (res.data or []))
 
 HANDLE_COLUMNS = {
-    "twitter": "twitter_handle", "discord": "discord_handle", "github": "github_handle",
-    "linkedin": "linkedin_handle", "notion": "notion_handle",
+    "twitter":  "twitter_handle",
+    "discord":  "discord_handle",
+    "github":   "github_handle",
+    "linkedin": "linkedin_handle",
+    "notion":   "notion_handle",
+    "gitlab":   "gitlab_handle",
+    "twitch":   "twitch_handle",
+    "spotify":  "spotify_handle",
 }
+
+# Which field of the provider's identity holds the handle, in order of preference
+HANDLE_KEYS = {
+    "twitter":  ("preferred_username", "user_name"),
+    "discord":  ("username", "full_name", "name"),
+    "github":   ("login", "user_name", "preferred_username"),
+    "linkedin": ("preferred_username", "name"),
+    "notion":   ("name",),
+    "gitlab":   ("preferred_username", "user_name"),
+    "twitch":   ("preferred_username", "nickname", "name"),
+    "spotify":  ("name", "preferred_username"),
+}
+
+# Telegram / Farcaster: the linked uid IS the platform user ID
+NATIVE_ID_COLUMNS = {"telegram": "telegram_user_id", "farcaster": "farcaster_id"}
 
 async def sync_profile_from_linked_socials(address: str) -> bool:
     """
-    Fills a missing profile email and missing social handles from the
-    wallet's already-linked Supabase socials. Returns True if a sync ran.
+    Fills missing profile fields from the wallet's already-linked socials:
+    email + handles from Supabase providers, and Telegram/Farcaster IDs
+    from linked_socials. Returns True if anything was synced.
     """
     address = address.lower()
 
-    rows = [
-        r for r in db_get_linked_socials_with_handles(address)
-        if r["provider"] in SUPABASE_OAUTH_PROVIDERS and r["provider"] != "passkey"
-    ]
-    if not rows:
+    all_rows = db_get_linked_socials_with_handles(address)
+    if not all_rows:
         return False
 
     prof = (
@@ -967,12 +988,40 @@ async def sync_profile_from_linked_socials(address: str) -> bool:
         .execute()
     )
     row = prof.data[0] if prof.data else {}
+    ran = False
+
+    # ── Telegram / Farcaster ─────────────────────────────────────────────────
+    if row:
+        patch = {}
+        for r in all_rows:
+            col = NATIVE_ID_COLUMNS.get(r["provider"])
+            if col and not row.get(col):
+                patch[col] = str(r["uid"])
+            if r["provider"] == "telegram" and r.get("handle") and not row.get("telegram_handle"):
+                patch["telegram_handle"] = r["handle"]
+        if patch:
+            try:
+                patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+                supabase.table("user_profiles").update(patch).eq("wallet_address", address).execute()
+                print(f"[profile-sync] {address}: updated {list(patch)}")
+                ran = True
+            except Exception as e:
+                print(f"[profile-sync] native id sync failed for {address}: {e}")
+
+    # ── Supabase providers: email + handles ──────────────────────────────────
+    rows = [
+        r for r in all_rows
+        if r["provider"] in SUPABASE_OAUTH_PROVIDERS and r["provider"] != "passkey"
+    ]
+    if not rows:
+        return ran
+
     linked = {r["provider"] for r in rows}
     missing_handle = any(
         p in linked and not row.get(col) for p, col in HANDLE_COLUMNS.items()
     )
     if row.get("email") and not missing_handle:
-        return False
+        return ran
 
     rows.sort(key=lambda r: PROFILE_SYNC_ORDER.index(r["provider"])
               if r["provider"] in PROFILE_SYNC_ORDER else 99)
@@ -984,6 +1033,7 @@ async def sync_profile_from_linked_socials(address: str) -> bool:
             user_cache[uid] = await fetch_supabase_user_admin(uid)
         user = user_cache[uid]
         if not user:
+            print(f"[profile-sync] {address}: no Supabase user for {r['provider']} ({uid})")
             continue
         _, meta = _profile_meta_from_user(r["provider"], user)
         upsert_profile_from_social(address, r["provider"], meta)
@@ -996,6 +1046,7 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
     Fills missing fields only — never overwrites a user's manual edits.
     Linking Google (or any provider with an email) sets the profile email
     when the profile has none, unless another profile already uses it.
+    Every linked provider's handle is written to its profile column.
     """
     wallet = evm_address.lower()
     email  = (profile_meta.get("email") or "").strip().lower()
@@ -1020,8 +1071,7 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
         if not row.get("avatar_url") and profile_meta.get("avatar_url"):
             patch["avatar_url"] = profile_meta["avatar_url"]
 
-        for field in ("twitter_handle", "discord_handle", "github_handle",
-                      "linkedin_handle", "notion_handle"):
+        for field in HANDLE_COLUMNS.values():
             if profile_meta.get(field):
                 patch[field] = profile_meta[field]
 
@@ -1051,14 +1101,9 @@ def upsert_profile_from_social(evm_address: str, provider: str, profile_meta: di
             "username":         username,
             "email":            safe_email,   # None, never "" — avoids unique-constraint clashes
             "avatar_url":       profile_meta.get("avatar_url") or "",
-            "twitter_handle":   profile_meta.get("twitter_handle"),
-            "discord_handle":   profile_meta.get("discord_handle"),
-            "github_handle":    profile_meta.get("github_handle"),
-            "linkedin_handle":  profile_meta.get("linkedin_handle"),
-            "notion_handle":    profile_meta.get("notion_handle"),
+            **{c: profile_meta.get(c) for c in HANDLE_COLUMNS.values()},
             "updated_at":       datetime.now(timezone.utc).isoformat(),
         }).execute()
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Profile backfill from already-linked socials
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1370,6 +1415,7 @@ async def link_social(
     """
     Link an additional social account to an already-authenticated wallet.
     Same provider split as /wallet/social-login.
+    The linked account is also written to the user's profile.
     """
     supabase_identities: list[dict] | None = None
     profile_meta: dict = {}
@@ -1391,6 +1437,10 @@ async def link_social(
         if not body.credential:
             raise HTTPException(400, "credential is required for telegram")
         uid = _verify_telegram_login(body.credential)
+        try:
+            handle = json.loads(body.credential).get("username")
+        except Exception:
+            handle = None
 
     elif provider == "farcaster":
         if not body.credential:
@@ -1406,15 +1456,27 @@ async def link_social(
         supabase_identities=supabase_identities,
     )
 
+    # Supabase providers: email + handle
     if provider in SUPABASE_OAUTH_PROVIDERS and profile_meta:
         try:
             upsert_profile_from_social(address, provider, profile_meta)
         except Exception as e:
             print(f"[profile-upsert] link failed for {provider}: {e}")
 
+    # Telegram / Farcaster: platform user ID (+ Telegram username)
+    if provider in NATIVE_ID_COLUMNS:
+        try:
+            patch = {NATIVE_ID_COLUMNS[provider]: str(uid)}
+            if provider == "telegram" and handle:
+                patch["telegram_handle"] = handle
+            supabase.table("user_profiles").update(patch).eq(
+                "wallet_address", address.lower()
+            ).execute()
+        except Exception as e:
+            print(f"[profile-upsert] {provider} link failed: {e}")
+
     linked = db_get_linked_socials(address)
     return {"success": True, "linked_socials": linked}
-
 
 @app.get("/wallet/me")
 async def get_wallet_me(address: str = Depends(get_current_address)):
@@ -1442,19 +1504,14 @@ async def get_wallet_me(address: str = Depends(get_current_address)):
 @app.post("/admin/backfill-profile-emails")
 async def backfill_profile_emails(x_admin_key: str = Header(...)):
     """
-    One-off: fill missing profile emails for every wallet that already has
-    Google linked. Run once after deploy:
+    One-off: sync every wallet's linked socials into its profile.
+    Run once after deploy:
       curl -X POST <backend>/admin/backfill-profile-emails -H "x-admin-key: <ADMIN_KEY>"
     """
     if not ADMIN_KEY or not hmac.compare_digest(x_admin_key, ADMIN_KEY):
         raise HTTPException(403, "Forbidden")
 
-    res = (
-        supabase.table("linked_socials")
-        .select("address")
-        .eq("provider", "google")
-        .execute()
-    )
+    res = supabase.table("linked_socials").select("address").execute()
     addresses = sorted({r["address"] for r in (res.data or [])})
 
     synced, failed = 0, 0
@@ -1467,6 +1524,7 @@ async def backfill_profile_emails(x_admin_key: str = Header(...)):
             print(f"[backfill] {addr}: {e}")
 
     return {"checked": len(addresses), "synced": synced, "failed": failed}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Passkey signing grant
@@ -1928,6 +1986,22 @@ async def unlink_social(
     supabase.table("linked_socials").delete().eq(
         "address", address.lower()
     ).eq("provider", provider).execute()
+
+    # Clear the matching profile fields (email is kept on purpose)
+    cleared = {}
+    if provider in HANDLE_COLUMNS:
+        cleared[HANDLE_COLUMNS[provider]] = None
+    if provider in NATIVE_ID_COLUMNS:
+        cleared[NATIVE_ID_COLUMNS[provider]] = None
+    if provider == "telegram":
+        cleared["telegram_handle"] = None
+    if cleared:
+        try:
+            supabase.table("user_profiles").update(cleared).eq(
+                "wallet_address", address.lower()
+            ).execute()
+        except Exception as e:
+            print(f"[profile-upsert] clear on unlink failed for {provider}: {e}")
 
     updated = db_get_linked_socials(address)
     return {"success": True, "linked_socials": updated}
