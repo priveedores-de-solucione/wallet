@@ -106,6 +106,7 @@ SUPABASE_OAUTH_PROVIDERS = {
     "kakao", "keycloak", "linkedin", "notion", "slack",
     "spotify", "twitch", "workos", "zoom",
     "passkey",   # ← Supabase WebAuthn; same token-verification path as OAuth
+    "email",     # ← Supabase email OTP / magic link; same token-verification path
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ SocialProvider = Literal[
     "apple", "azure", "bitbucket", "gitlab", "figma",
     "kakao", "keycloak", "linkedin", "notion", "slack",
     "spotify", "twitch", "workos", "zoom",
-    "passkey",
+    "passkey", "email",
     # ── Custom / non-OAuth ────────────────────────────────────────────────
     "telegram", "farcaster", "phone",
 ]
@@ -143,6 +144,9 @@ class LinkSocialRequest(BaseModel):
 
 class ImportPrivySeedRequest(BaseModel):
     mnemonic: str
+
+class SwitchToLegacyRequest(BaseModel):
+    confirm: bool = False   # False = preview only, True = actually switch
 
 class WalletResponse(BaseModel):
     address:              str
@@ -568,137 +572,117 @@ def db_get_wallet_by_any_supabase_identity(
 # DB helpers — legacy Privy lookups
 # ─────────────────────────────────────────────────────────────────────────────
 
-def db_find_legacy_by_social(provider: str, uid: str, handle: str | None = None) -> dict | None:
-    if provider == "telegram":
-        res = (
-            supabase.table("legacy_privy_users")
-            .select("*")
-            .eq("telegram_id", uid)
-            .eq("claimed", False)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+LEGACY_HANDLE_COLUMNS = {
+    "twitter": "twitter_handle",
+    "discord": "discord_handle",
+    "github":  "github_handle",
+}
+LEGACY_NATIVE_ID_COLUMNS = {
+    "telegram":  "telegram_id",
+    "farcaster": "farcaster_id",
+}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-    if provider == "farcaster":
-        res = (
-            supabase.table("legacy_privy_users")
-            .select("*")
-            .eq("farcaster_id", uid)
-            .eq("claimed", False)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
 
-    if not handle:
-        return None
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards so 'a_b' can't match 'axb'."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    normalized = handle.lower().lstrip("@")
 
-    if provider == "google":
-        res = (
-            supabase.table("legacy_privy_users")
-            .select("*")
-            .ilike("google_email", normalized)
-            .eq("claimed", False)
-            .limit(1)
-            .execute()
-        )
+def _legacy_match_keys(
+    provider:   str,
+    uid:        str,
+    handle:     str | None = None,
+    identities: list[dict] | None = None,
+) -> list[tuple[str, str, bool]]:
+    """
+    Every (column, value, exact) pair to try against legacy_privy_users.
+    Uses ALL identities on the Supabase account (X, Google, email, GitHub…),
+    not just the provider the user clicked, so an X login whose account also
+    carries an email still finds a Privy user who signed up with that email.
+    """
+    keys:    list[tuple[str, str, bool]] = []
+    emails:  list[str] = []
+    handles: list[tuple[str, str]] = []
+
+    def add_email(v):
+        v = (v or "").strip().lower()
+        if v and _EMAIL_RE.match(v) and v not in emails:
+            emails.append(v)
+
+    def add_handle(p, v):
+        col = LEGACY_HANDLE_COLUMNS.get(p)
+        v   = str(v or "").strip().lower().lstrip("@").removesuffix("#0")
+        if col and v and (col, v) not in handles:
+            handles.append((col, v))
+
+    native_col = LEGACY_NATIVE_ID_COLUMNS.get(provider)
+    if native_col and uid:
+        keys.append((native_col, str(uid), True))
+
+    # The handle of the provider used for this login comes first
+    if handle:
+        if _EMAIL_RE.match(handle.strip()):
+            add_email(handle)
+        else:
+            add_handle(provider, handle)
+
+    for ident in identities or []:
+        add_email(ident.get("email"))
+        for h in ident.get("handles") or []:
+            add_handle(ident.get("provider", ""), h)
+
+    for e in emails:
+        keys.append(("google_email", e, False))
+        keys.append(("email", e, False))
+    for col, h in handles:
+        keys.append((col, h, False))
+        keys.append((col, "@" + h, False))   # some Privy rows keep the @
+
+    return keys
+
+
+def _legacy_find_row(keys: list[tuple[str, str, bool]], claimed: bool, select: str = "*") -> dict | None:
+    for col, value, exact in keys:
+        q = supabase.table("legacy_privy_users").select(select).eq("claimed", claimed)
+        q = q.eq(col, value) if exact else q.ilike(col, _like_escape(value))
+        try:
+            res = q.limit(1).execute()
+        except Exception as e:
+            print(f"[legacy-lookup] {col} query failed: {e}")
+            continue
         if res.data:
+            print(f"[legacy-lookup] matched on {col} (claimed={claimed})")
             return res.data[0]
-        res = (
-            supabase.table("legacy_privy_users")
-            .select("*")
-            .ilike("email", normalized)
-            .eq("claimed", False)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+    return None
 
-    col_map = {
-        "twitter": "twitter_handle",
-        "discord": "discord_handle",
-        "github":  "github_handle",
-    }
-    col = col_map.get(provider)
-    if not col:
-        return None
 
-    res = (
-        supabase.table("legacy_privy_users")
-        .select("*")
-        .ilike(col, normalized)
-        .eq("claimed", False)
-        .limit(1)
-        .execute()
-    )
-    return res.data[0] if res.data else None
+def db_find_legacy_by_social(
+    provider:   str,
+    uid:        str,
+    handle:     str | None = None,
+    identities: list[dict] | None = None,
+) -> dict | None:
+    """Unclaimed legacy Privy row matching any of the user's identifiers."""
+    keys = _legacy_match_keys(provider, uid, handle, identities)
+    return _legacy_find_row(keys, claimed=False)
+
 
 def db_find_claimed_legacy_wallet(
-    provider: str, uid: str, handle: str | None = None
+    provider:   str,
+    uid:        str,
+    handle:     str | None = None,
+    identities: list[dict] | None = None,
 ) -> dict | None:
     """
     For returning users whose linked_socials row is missing (e.g. new Supabase UID
-    after a cookie wipe), find a *claimed* legacy row that matches by handle/uid
+    after a cookie wipe), find a *claimed* legacy row that matches any identifier
     and return the wallet that was linked to it.
     """
-    col_uid_map = {
-        "telegram":  "telegram_id",
-        "farcaster": "farcaster_id",
-    }
-    col_uid = col_uid_map.get(provider)
-    if col_uid:
-        res = (
-            supabase.table("legacy_privy_users")
-            .select("embedded_evm_address")
-            .eq(col_uid, uid)
-            .eq("claimed", True)
-            .limit(1)
-            .execute()
-        )
-        if res.data and res.data[0].get("embedded_evm_address"):
-            return db_get_wallet(res.data[0]["embedded_evm_address"])
-
-    if not handle:
-        return None
-
-    normalized = handle.lower().lstrip("@")
-
-    if provider == "google":
-        for col in ("google_email", "email"):
-            res = (
-                supabase.table("legacy_privy_users")
-                .select("embedded_evm_address")
-                .ilike(col, normalized)
-                .eq("claimed", True)
-                .limit(1)
-                .execute()
-            )
-            if res.data and res.data[0].get("embedded_evm_address"):
-                return db_get_wallet(res.data[0]["embedded_evm_address"])
-        return None
-
-    col_handle_map = {
-        "twitter": "twitter_handle",
-        "discord": "discord_handle",
-        "github":  "github_handle",
-    }
-    col = col_handle_map.get(provider)
-    if not col:
-        return None
-
-    res = (
-        supabase.table("legacy_privy_users")
-        .select("embedded_evm_address")
-        .ilike(col, normalized)
-        .eq("claimed", True)
-        .limit(1)
-        .execute()
-    )
-    if res.data and res.data[0].get("embedded_evm_address"):
-        return db_get_wallet(res.data[0]["embedded_evm_address"])
+    keys = _legacy_match_keys(provider, uid, handle, identities)
+    row  = _legacy_find_row(keys, claimed=True, select="embedded_evm_address")
+    if row and row.get("embedded_evm_address"):
+        return db_get_wallet(row["embedded_evm_address"])
     return None
 
 def db_mark_legacy_claimed(legacy_id: str, wallet_address: str):
@@ -796,25 +780,36 @@ async def resolve_supabase_provider_uid(
         raise HTTPException(500, "Supabase returned no user ID")
 
     handle, profile_meta = _profile_meta_from_user(provider, user_data)
+    return uid, handle, profile_meta, _normalize_identities(user_data)
 
-    # Normalized identity list for cross-provider lookup.
-    # Supabase uses "x" for Twitter internally; we store "twitter".
-    # "email" provider entries (email/password) are not wallet login methods — skip.
-    normalized_identities: list[dict] = [{
+
+def _normalize_identities(user_data: dict) -> list[dict]:
+    """
+    Normalized identity list for cross-provider lookup + legacy Privy matching.
+    Supabase uses "x" for Twitter internally; we store "twitter".
+    Each entry also carries the identity's email and handles so the legacy
+    lookup can match on any of them, not just the provider used to log in.
+    """
+    normalized: list[dict] = [{
         "provider": "__supabase_uid__",   # sentinel — only used for cross-lookup
-        "id": uid,
+        "id":       user_data.get("id", ""),
+        "email":    user_data.get("email"),
+        "handles":  [],
     }]
 
     for ident in user_data.get("identities") or []:
-        raw_p = ident.get("provider", "")
-        if raw_p == "email":
-            continue
-        normalized_identities.append({
-            "provider": "twitter" if raw_p == "x" else raw_p,
+        raw_p   = ident.get("provider", "")
+        p       = "twitter" if raw_p == "x" else raw_p
+        id_data = ident.get("identity_data") or {}
+        handle_keys = HANDLE_KEYS.get(p, ()) + ("user_name", "preferred_username")
+        normalized.append({
+            "provider": p,
             "id":       ident.get("id", ""),
+            "email":    id_data.get("email"),
+            "handles":  [id_data[k] for k in handle_keys if id_data.get(k)],
         })
 
-    return uid, handle, profile_meta, normalized_identities
+    return normalized
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core: get-or-create wallet
@@ -864,7 +859,7 @@ def get_or_create_wallet(
     if existing:
         legacy = None
         if not existing.get("legacy_import_completed"):
-            legacy = db_find_legacy_by_social(provider, uid, handle)
+            legacy = db_find_legacy_by_social(provider, uid, handle, supabase_identities)
         existing = _backfill_chain_addresses(existing)
         return existing, legacy
 
@@ -882,7 +877,7 @@ def get_or_create_wallet(
             return cross_wallet, None
 
     # ── 3. Unclaimed legacy Privy record ──────────────────────────────────────
-    legacy = db_find_legacy_by_social(provider, uid, handle)
+    legacy = db_find_legacy_by_social(provider, uid, handle, supabase_identities)
 
     if legacy and legacy.get("embedded_evm_address"):
         legacy_evm = legacy["embedded_evm_address"].lower()
@@ -904,7 +899,7 @@ def get_or_create_wallet(
         return wallet, legacy
 
     # ── 4. Previously-claimed legacy (prevents duplicate wallets) ─────────────
-    recovered = db_find_claimed_legacy_wallet(provider, uid, handle)
+    recovered = db_find_claimed_legacy_wallet(provider, uid, handle, supabase_identities)
     if recovered:
         try:
             db_link_social(recovered["address"], provider, uid, handle=handle)
@@ -1360,8 +1355,11 @@ async def social_login(body: SocialLoginRequest):
     elif provider == "telegram":
         if not body.credential:
             raise HTTPException(400, "credential is required for telegram login")
-        uid    = _verify_telegram_login(body.credential)
-        handle = None
+        uid = _verify_telegram_login(body.credential)
+        try:
+            handle = json.loads(body.credential).get("username")
+        except Exception:
+            handle = None
 
     elif provider == "farcaster":
         if not body.credential:
@@ -1648,6 +1646,124 @@ async def import_privy_seed(
         "legacy_linked":   legacy is not None,
         "message":         "Wallet imported successfully.",
     }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Switch to old Privy wallet
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/wallet/switch-to-legacy")
+async def switch_to_legacy(
+    body:    SwitchToLegacyRequest,
+    address: str = Depends(get_current_address),
+):
+    """
+    For users who were given a new wallet before their old Privy account was
+    matched. Finds the unclaimed legacy row for any of this wallet's logins and
+    moves those logins (plus PIN, security questions and profile) to the old
+    wallet address.
+
+    Call with confirm=false first to preview, then confirm=true to switch.
+    The current wallet row is kept untouched — the frontend should tell the
+    user to export its seed phrase first if it holds funds, because after the
+    switch these logins open the old wallet instead.
+    """
+    address = address.lower()
+    current = db_get_wallet(address)
+    if not current:
+        raise HTTPException(404, "Wallet not found")
+
+    rows = db_get_linked_socials_with_handles(address)
+    if not rows:
+        raise HTTPException(400, "This wallet has no linked logins")
+
+    # Find the legacy row using every identity on every linked login
+    legacy = None
+    identity_cache: dict[str, list[dict] | None] = {}
+    for r in rows:
+        identities = None
+        if r["provider"] in SUPABASE_OAUTH_PROVIDERS:
+            uid = r["uid"]
+            if uid not in identity_cache:
+                user = await fetch_supabase_user_admin(uid)
+                identity_cache[uid] = _normalize_identities(user) if user else None
+            identities = identity_cache[uid]
+        legacy = db_find_legacy_by_social(r["provider"], r["uid"], r.get("handle"), identities)
+        if legacy:
+            break
+
+    if not legacy or not legacy.get("embedded_evm_address"):
+        raise HTTPException(404, "No old Privy account found for your linked logins")
+
+    legacy_evm = legacy["embedded_evm_address"].lower()
+    if legacy_evm == address:
+        raise HTTPException(400, "You're already using your old wallet")
+
+    if not body.confirm:
+        return {
+            "switched":           False,
+            "current_address":    address,
+            "legacy_evm_address": legacy_evm,
+            "legacy_sol_address": legacy.get("embedded_solana_address"),
+            "message": (
+                "Your old wallet was found. Export the seed phrase of your current "
+                "wallet first if it holds funds, then confirm to switch."
+            ),
+        }
+
+    # ── Switch ────────────────────────────────────────────────────────────────
+    target = db_get_wallet(legacy_evm) or db_create_wallet(
+        legacy_evm, "embedded", None,
+        solana_address=legacy.get("embedded_solana_address"),
+        stellar_address=None,
+    )
+
+    # Move every login to the old wallet
+    supabase.table("linked_socials").update({
+        "address": legacy_evm,
+    }).eq("address", address).execute()
+
+    # Carry PIN + security questions over if the old wallet has none
+    carry = {}
+    if current.get("pin_hash") and not target.get("pin_hash"):
+        carry["pin_hash"] = current["pin_hash"]
+    if current.get("security_questions") and not target.get("security_questions"):
+        carry["security_questions"] = current["security_questions"]
+    if carry:
+        supabase.table("wallets").update(carry).eq("address", legacy_evm).execute()
+        target.update(carry)
+
+    # Move the profile if the old wallet doesn't have one yet
+    try:
+        has_profile = (
+            supabase.table("user_profiles").select("wallet_address")
+            .eq("wallet_address", legacy_evm).execute().data
+        )
+        if not has_profile:
+            supabase.table("user_profiles").update({
+                "wallet_address": legacy_evm,
+                "updated_at":     datetime.now(timezone.utc).isoformat(),
+            }).eq("wallet_address", address).execute()
+    except Exception as e:
+        print(f"[switch-legacy] profile move failed {address} → {legacy_evm}: {e}")
+
+    print(f"[switch-legacy] moved logins {address} → {legacy_evm} (privy_id={legacy.get('privy_id')})")
+
+    linked = db_get_linked_socials(legacy_evm)
+    resp = WalletResponse(
+        address            = legacy_evm,
+        token              = create_token(legacy_evm),
+        linked_socials     = linked,
+        evm_address        = legacy_evm,
+        solana_address     = target.get("solana_address"),
+        stellar_address    = target.get("stellar_address"),
+        legacy_found       = True,
+        legacy_privy_id    = legacy.get("privy_id"),
+        legacy_evm_address = legacy_evm,
+        legacy_sol_address = legacy.get("embedded_solana_address"),
+        has_pin            = bool(target.get("pin_hash")),
+        needs_seed_import  = not target.get("encrypted_mnemonic"),
+    )
+    return {"switched": True, "previous_address": address, **resp.model_dump()}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PIN endpoints
